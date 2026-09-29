@@ -1,0 +1,37 @@
+{
+  "name": "opencode-remove-to-trash",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that routes rm and patch deletions to the system Trash instead of deleting them forever.",
+  "type": "module",
+  "main": "rm-to-trash.ts",
+  "exports": {
+    ".": "./rm-to-trash.ts"
+  },
+  "files": [
+    "rm-to-trash.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "trash",
+    "rm",
+    "safety",
+    "delete",
+    "recover"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "latest",
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}
