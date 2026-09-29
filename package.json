@@ -22,6 +22,14 @@
     "recover"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ryan9438/opencode-remove-to-trash.git"
+  },
+  "homepage": "https://github.com/Ryan9438/opencode-remove-to-trash#readme",
+  "bugs": {
+    "url": "https://github.com/Ryan9438/opencode-remove-to-trash/issues"
+  },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"
