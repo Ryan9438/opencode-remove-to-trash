@@ -1,4 +1,3 @@
-import type { Plugin } from "@opencode-ai/plugin"
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs"
 import { execFile, spawnSync } from "node:child_process"
 import { homedir } from "node:os"
@@ -25,6 +24,144 @@ const PREFIX_WORDS = new Set([
   "else",
   "elif",
 ])
+
+/**
+ * Commands that would permanently destroy data and cannot be safely rewritten
+ * to a reversible move. They are rejected so an agent cannot route around the
+ * Trash guarantee through an alternate binary, an empty-Trash call, or a
+ * nested interpreter.
+ *
+ * Detection is command-position aware: it walks unquoted shell segments, so
+ * the words "empty trash" inside a quoted argument or a commit message are
+ * not treated as commands.
+ */
+function splitSegments(command: string): string[] {
+  const segments: string[] = []
+  let current = ""
+  let single = false
+  let double = false
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (single) {
+      current += ch
+      if (ch === "'") single = false
+      continue
+    }
+    if (double) {
+      if (ch === "\\") {
+        current += ch + (command[i + 1] ?? "")
+        i++
+        continue
+      }
+      current += ch
+      if (ch === '"') double = false
+      continue
+    }
+    if (ch === "'") {
+      single = true
+      current += ch
+      continue
+    }
+    if (ch === '"') {
+      double = true
+      current += ch
+      continue
+    }
+    if (SEGMENT_END.has(ch) || ch === "(") {
+      segments.push(current)
+      current = ""
+      continue
+    }
+    current += ch
+  }
+  segments.push(current)
+  return segments
+}
+
+function baseName(token: string): string {
+  const clean = token.replace(/^["']|["']$/g, "")
+  const slash = clean.lastIndexOf("/")
+  return slash >= 0 ? clean.slice(slash + 1) : clean
+}
+
+export function findBlockedCommand(command: string): string | undefined {
+  for (const segment of splitSegments(command)) {
+    const trimmed = segment.trim()
+    if (!trimmed) continue
+
+    const words = trimmed.split(/\s+/)
+    let i = 0
+    while (i < words.length && PREFIX_WORDS.has(baseName(words[i]!))) i++
+    if (i >= words.length) continue
+
+    const rawName = words[i]!
+    const name = baseName(rawName)
+    const rest = words.slice(i + 1).join(" ")
+
+    if (name === "rm") {
+      if (rawName.includes("/")) return "absolute-path rm"
+      if (/(?:\.Trash\b|\.local\/share\/Trash\b)/.test(rest)) {
+        return "deleting the Trash directory"
+      }
+      continue
+    }
+
+    if (name === "osascript") {
+      if (/\b(?:empty|delete)\b[\s\S]*\btrash\b/i.test(rest)) {
+        return "emptying or deleting the Trash via osascript"
+      }
+      continue
+    }
+
+    if (name === "trash-empty") return "trash-empty"
+
+    if (name === "gio") {
+      if (/^trash\b/.test(rest) && /\s(?:--empty|-e)\b/.test(rest)) {
+        return "gio trash --empty"
+      }
+      continue
+    }
+
+    if (name === "busybox") {
+      if (baseName(words[i + 1] ?? "") === "rm") return "busybox rm"
+      continue
+    }
+
+    if (name === "unlink" || name === "shred" || name === "srm" || name === "wipe") {
+      return "permanent-delete command"
+    }
+
+    if (name === "find") {
+      if (/\s-delete\b/.test(rest)) return "find -delete"
+      continue
+    }
+
+    if (name === "sudo") {
+      if (words.slice(i + 1).some((word) => baseName(word) === "rm")) return "sudo rm"
+      continue
+    }
+
+    if (name === "bash" || name === "sh" || name === "zsh" || name === "dash") {
+      if (/-c\b/.test(rest) && /\brm\b/.test(rest)) return "nested shell rm"
+      continue
+    }
+
+    if (/^python[0-9.]*$/.test(name)) {
+      if (/\b(?:os\.remove|os\.unlink|shutil\.rmtree)\b/.test(rest)) {
+        return "Python deletion API"
+      }
+      continue
+    }
+
+    if (name === "node") {
+      if (/\b(?:fs\.rmSync|fs\.rm\b|rmSync|unlinkSync|rmdirSync)\b/.test(rest)) {
+        return "Node deletion API"
+      }
+      continue
+    }
+  }
+  return undefined
+}
 
 interface Backend {
   argv: string[]
@@ -257,48 +394,75 @@ function hasRemainingOps(patchText: string): boolean {
   return /^\*\*\* (Add File|Update File|Delete File):/m.test(patchText)
 }
 
-export default (async ({ client, directory }) => {
-  const backend = resolveTrash()
-  const label = backend ? (backend.builtin ? "built-in fallback" : backend.argv.join(" ")) : "none"
+/* ------------------------------------------------------------------ *
+ * OpenCode 2.x (V2) plugin API. Structural types on purpose: the host
+ * passes its own context object and we avoid a hard runtime dependency
+ * on @opencode/plugin. Mirrors `Plugin.Context` / `Plugin.define`.
+ * ------------------------------------------------------------------ */
+type ToolExecuteBeforeEvent = {
+  readonly tool: string
+  readonly sessionID: string
+  readonly messageID: string
+  readonly id: string
+  input: unknown
+}
 
-  try {
-    await client.app.log({
-      body: {
-        service: "rm-to-trash",
-        level: backend ? "info" : "warn",
-        message: backend
-          ? `active (using: ${label})`
-          : "no trash backend available; rm rewrite disabled",
-      },
-    })
-  } catch {}
+type Registration = { dispose: () => Promise<void> | void }
 
-  return {
-    "tool.execute.before": async (input, output) => {
-      if (!backend) return
-      const args = output.args
-      if (!args || typeof args !== "object") return
+type V2Context = {
+  readonly location?: { readonly directory?: string }
+  readonly tool: {
+    hook: (
+      name: "execute.before",
+      callback: (event: ToolExecuteBeforeEvent) => void | Promise<void>,
+    ) => Promise<Registration>
+  }
+}
 
-      if (SHELL_TOOLS.has(input.tool)) {
+const RmToTrash = {
+  id: "rm-to-trash",
+  async setup(ctx: V2Context) {
+    const backend = resolveTrash()
+    if (!backend) return
+
+    const directory = ctx.location?.directory ?? process.cwd()
+
+    const registration = await ctx.tool.hook("execute.before", async (event) => {
+      const raw = event.input
+      if (!raw || typeof raw !== "object") return
+      const args = { ...(raw as Record<string, unknown>) }
+      const tool = event.tool.toLowerCase()
+
+      if (SHELL_TOOLS.has(tool)) {
         const command = args.command
-        if (typeof command === "string" && command.includes("rm")) {
-          const rewritten = rewriteRmCommand(command)
-          if (rewritten !== command) args.command = rewritten
+        if (typeof command === "string") {
+          const blocked = findBlockedCommand(command)
+          if (blocked) {
+            throw new Error(
+              `rm-to-trash: blocked a command that would permanently delete data (${blocked}). ` +
+                `Nothing was executed. Use a reversible delete (move to Trash) or ask the user how to proceed.`,
+            )
+          }
+          if (command.includes("rm")) {
+            const rewritten = rewriteRmCommand(command)
+            if (rewritten !== command) {
+              args.command = rewritten
+              event.input = args
+            }
+          }
         }
         return
       }
 
-      if (PATCH_TOOLS.has(input.tool)) {
+      if (PATCH_TOOLS.has(tool)) {
         const patchText = args.patchText
         if (typeof patchText !== "string" || !patchText.includes("Delete File")) return
         const { text, paths } = splitPatchDeletes(patchText)
         if (paths.length === 0) return
         try {
-          await execFileAsync(
-            backend.argv[0]!,
-            [...backend.argv.slice(1), ...paths],
-            { cwd: directory },
-          )
+          await execFileAsync(backend.argv[0]!, [...backend.argv.slice(1), ...paths], {
+            cwd: directory,
+          })
         } catch (err) {
           throw new Error(
             `rm-to-trash: failed to move to Trash: ${paths.join(", ")} (${
@@ -312,7 +476,12 @@ export default (async ({ client, directory }) => {
           )
         }
         args.patchText = text
+        event.input = args
       }
-    },
-  }
-}) satisfies Plugin
+    })
+
+    return () => registration.dispose()
+  },
+}
+
+export default RmToTrash
